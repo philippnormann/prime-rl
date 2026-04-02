@@ -76,8 +76,6 @@ from prime_rl.utils.utils import (
     strip_env_version,
     to_col_format,
 )
-
-
 @clean_exit
 async def orchestrate(config: OrchestratorConfig):
     # Initialize the logger
@@ -315,7 +313,7 @@ async def orchestrate(config: OrchestratorConfig):
     train_dataset = train_env_group.get_dataset(seed=config.buffer.seed)
     buffer = Buffer(train_dataset, train_env_group.env_names, config.buffer)
     if config.val is not None:
-        val_buffer_config = BufferConfig(env_ratios=config.buffer.env_ratios)
+        val_buffer_config = config.buffer.for_eval_sampling()
         val_dataset = train_env_group.get_eval_dataset(seed=val_buffer_config.seed)
         val_buffer = Buffer(val_dataset, train_env_group.env_names, val_buffer_config)
     else:
@@ -703,10 +701,15 @@ async def orchestrate(config: OrchestratorConfig):
             solve_all = (reward_per_problem == config.rollouts_per_example).mean()
             return solve_none, solve_all, 1 - solve_none - solve_all
 
+        def complete_env_ratios(df: pd.DataFrame) -> dict[str, float]:
+            env_ratios = df.task.value_counts(normalize=True).to_dict()
+            return {env: env_ratios.get(env, 0.0) for env in train_env_group.env_names}
+
         # Group by example_id to average across rollouts within each problem
         by_example = results_df.groupby("example_id")
 
         solve_none, solve_all, effective_batch_size = compute_solve_rates(results_df)
+        batch_env_ratios = complete_env_ratios(results_df)
         to_log = {
             # Progress metrics
             "progress/tokens": num_tokens,
@@ -758,7 +761,7 @@ async def orchestrate(config: OrchestratorConfig):
             "solve_none/all": solve_none,
             "solve_all/all": solve_all,
             "effective_batch_size/all": effective_batch_size,
-            **{f"batch/{env}": r for env, r in results_df.task.value_counts(normalize=True).items()},
+            **{f"batch/{env}": ratio for env, ratio in batch_env_ratios.items()},
             # Time metrics
             "time/step": step_time,
             "time/generate_completions": generate_completions_time,
@@ -818,6 +821,8 @@ async def orchestrate(config: OrchestratorConfig):
             to_log["val/reward/all/mean"] = val_by_example.reward.mean().mean()
             to_log["val/reward/all/max"] = val_by_example.reward.mean().max()
             to_log["val/reward/all/min"] = val_by_example.reward.mean().min()
+            val_env_ratios = complete_env_ratios(val_results_df)
+            to_log.update({f"val_batch/{env}": ratio for env, ratio in val_env_ratios.items()})
             for env, env_df in val_results_df.groupby("task"):
                 env_by_example = env_df.groupby("example_id")
                 to_log[f"val/reward/{env}/mean"] = env_by_example.reward.mean().mean()

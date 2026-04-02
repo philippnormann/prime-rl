@@ -482,6 +482,17 @@ class BufferConfig(BaseConfig):
         ),
     ] = None
 
+    env_sampling_strategy: Annotated[
+        Literal["random", "round_robin"],
+        Field(
+            description=(
+                "How to choose environments when sampling examples. "
+                "'random' uses env_ratios or the natural dataset distribution; "
+                "'round_robin' cycles through non-empty environments in shuffled order."
+            )
+        ),
+    ] = "random"
+
     easy_threshold: Annotated[
         float | None,
         Field(
@@ -539,7 +550,15 @@ class BufferConfig(BaseConfig):
     def validate_env_ratios(self):
         if self.env_ratios is not None:
             assert all(ratio > 0 for ratio in self.env_ratios), "All env_ratios must be positive."
+            if self.env_sampling_strategy != "random":
+                raise ValueError("env_ratios is only supported with env_sampling_strategy='random'.")
         return self
+
+    def for_eval_sampling(self) -> "BufferConfig":
+        return type(self)(
+            env_ratios=self.env_ratios,
+            env_sampling_strategy=self.env_sampling_strategy,
+        )
 
 
 class VerificationConfig(BaseConfig):

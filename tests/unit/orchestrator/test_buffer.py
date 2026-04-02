@@ -206,3 +206,78 @@ def test_buffer_no_cross_env_pool_assignment(mock_openai_client, tmp_path):
     assert len(new_buffer.easy_examples) == 0
     # Should still be in normal pool for env_b
     assert len(new_buffer.example_buffer["env_b"]) == 1
+
+
+def test_round_robin_balances_draws(dummy_env_group):
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(dataset, dummy_env_group.env_names, BufferConfig(env_sampling_strategy="round_robin", seed=123))
+
+    counts = {env: 0 for env in dummy_env_group.env_names}
+    for sample in buffer.sample_examples(20):
+        counts[sample["task"]] += 1
+
+    assert counts == {"env_a": 10, "env_b": 10}
+
+
+def test_round_robin_skips_empty_env(dummy_env_group):
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(dataset, dummy_env_group.env_names, BufferConfig(env_sampling_strategy="round_robin", seed=123))
+
+    buffer.example_buffer["env_b"].clear()
+
+    assert all(sample["task"] == "env_a" for sample in buffer.sample_examples(6))
+
+
+def test_round_robin_rejects_env_ratios():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="env_ratios is only supported"):
+        BufferConfig(env_sampling_strategy="round_robin", env_ratios=[0.5, 0.5])
+
+
+def test_sampled_env_ratio_metrics(dummy_env_group):
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(dataset, dummy_env_group.env_names, BufferConfig(env_sampling_strategy="round_robin", seed=123))
+
+    buffer.sample_examples(4)
+    metrics = buffer.get_metrics()
+
+    assert metrics["sampled_env_ratio/env_a"] == 0.5
+    assert metrics["sampled_env_ratio/env_b"] == 0.5
+
+
+def test_sampled_env_ratio_zero_when_no_samples(dummy_env_group):
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(dataset, dummy_env_group.env_names, BufferConfig())
+
+    metrics = buffer.get_metrics()
+
+    assert metrics["sampled_env_ratio/env_a"] == 0.0
+    assert metrics["sampled_env_ratio/env_b"] == 0.0
+
+
+def test_round_robin_is_stateful_across_small_calls(dummy_env_group):
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(dataset, dummy_env_group.env_names, BufferConfig(env_sampling_strategy="round_robin", seed=123))
+
+    first_cycle = [buffer.sample_examples(1)[0]["task"] for _ in range(2)]
+    second_cycle = [buffer.sample_examples(1)[0]["task"] for _ in range(2)]
+
+    assert set(first_cycle) == {"env_a", "env_b"}
+    assert set(second_cycle) == {"env_a", "env_b"}
+
+
+def test_round_robin_load_resets_cycle(dummy_env_group, tmp_path):
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(dataset, dummy_env_group.env_names, BufferConfig(env_sampling_strategy="round_robin", seed=123))
+
+    first_env = buffer.sample_examples(1)[0]["task"]
+    remaining_env = next(iter({"env_a", "env_b"} - {first_env}))
+    assert buffer._env_cycle == [remaining_env]
+
+    buffer.save(tmp_path / "buffer")
+    buffer.load(tmp_path / "buffer")
+
+    assert buffer._env_cycle == []
+    resumed_cycle = [buffer.sample_examples(1)[0]["task"] for _ in range(2)]
+    assert set(resumed_cycle) == {"env_a", "env_b"}

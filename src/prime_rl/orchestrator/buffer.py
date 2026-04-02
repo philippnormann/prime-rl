@@ -52,21 +52,27 @@ class Buffer:
             f"Initialized buffer with {format_num(len(self.dataset), precision=0)} example(s) in {len(self.env_names)} environment(s)"
         )
 
-        if self.config.env_ratios is not None:
-            # Convert ratios to probabilities
-            env_ratio = mean_normalize(self.config.env_ratios)
-            self.env_probs = {env_name: ratio for env_name, ratio in zip(self.env_names, env_ratio)}
-            self.logger.debug(
-                f"Sampling buffer according to provided environment ratios ({', '.join(f'{k}={v:.2f}' for k, v in self.env_probs.items())})"
-            )
+        self._env_cycle: list[str] = []
+        if self.config.env_sampling_strategy == "random":
+            if self.config.env_ratios is not None:
+                env_ratio = mean_normalize(self.config.env_ratios)
+                self.env_probs = {env_name: ratio for env_name, ratio in zip(self.env_names, env_ratio)}
+                self.logger.debug(
+                    "Sampling buffer with random env selection using provided environment ratios "
+                    f"({', '.join(f'{k}={v:.2f}' for k, v in self.env_probs.items())})"
+                )
+            else:
+                env_counts = [len(self.example_buffer[env_name]) for env_name in self.env_names]
+                env_ratio = mean_normalize(env_counts)
+                self.env_probs = {env_name: ratio for env_name, ratio in zip(self.env_names, env_ratio)}
+                self.logger.debug(
+                    "Sampling buffer with random env selection using the natural environment distribution "
+                    f"({', '.join(f'{k}={v:.2f}' for k, v in self.env_probs.items())})"
+                )
+            self._sample_envs = self._sample_envs_random
         else:
-            # Count examples per environment to sample according to natural env distribution
-            env_counts = [len(self.example_buffer[env_name]) for env_name in self.env_names]
-            env_ratio = mean_normalize(env_counts)
-            self.env_probs = {env_name: ratio for env_name, ratio in zip(self.env_names, env_ratio)}
-            self.logger.debug(
-                f"Sampling buffer according to natural environment distribution ({', '.join(f'{k}={v:.2f}' for k, v in self.env_probs.items())})"
-            )
+            self.logger.debug("Sampling buffer with round-robin env selection across non-empty environments")
+            self._sample_envs = self._sample_envs_round_robin
 
         # Initialize buffers for easy/ hard examples
         self.easy_examples: list[dict] = []
@@ -97,7 +103,8 @@ class Buffer:
         write_jsonl(self.rollout_buffer, path / "rollout_buffer.jsonl")
 
     def load(self, path: Path) -> None:
-        """Loads pool assignments and rollouts."""
+        """Loads pool assignments and rollouts and resets any in-memory round-robin cycle."""
+        self._env_cycle = []
 
         def read_jsonl(path: Path) -> list[dict]:
             with open(path, "r") as f:
@@ -192,20 +199,41 @@ class Buffer:
             self.logger.debug("No easy/ hard examples or rollouts found in checkpoint")
 
     def sample_examples(self, n: int) -> list[dict]:
-        """Samples n examples from the buffer, respecting env ratios."""
+        """Samples n examples from the buffer using the configured env sampling strategy."""
 
         non_empty_envs = [env for env, examples in self.example_buffer.items() if examples]
 
         if not non_empty_envs:
             raise ValueError("No environments left with examples.")
 
-        non_empty_env_probs = [self.env_probs[env] for env in non_empty_envs]
         sampled_examples = []
-        for sampled_env in random.choices(non_empty_envs, weights=non_empty_env_probs, k=n):
+        for sampled_env in self._sample_envs(non_empty_envs, n):
             sampled_example = random.choice(list(self.example_buffer[sampled_env].values()))
             sampled_examples.append(sampled_example)
+            self.num_sampled_examples_per_step[sampled_env] += 1
 
         return sampled_examples
+
+    def _sample_envs_random(self, non_empty_envs: list[str], n: int) -> list[str]:
+        non_empty_env_probs = [self.env_probs[env] for env in non_empty_envs]
+        return random.choices(non_empty_envs, weights=non_empty_env_probs, k=n)
+
+    def _sample_envs_round_robin(self, non_empty_envs: list[str], n: int) -> list[str]:
+        active_envs = set(non_empty_envs)
+        env_cycle = [env for env in self._env_cycle if env in active_envs]
+        sampled_envs: list[str] = []
+
+        while len(sampled_envs) < n:
+            if not env_cycle:
+                env_cycle = non_empty_envs.copy()
+                random.shuffle(env_cycle)
+
+            take = min(n - len(sampled_envs), len(env_cycle))
+            sampled_envs.extend(env_cycle[:take])
+            env_cycle = env_cycle[take:]
+
+        self._env_cycle = env_cycle
+        return sampled_envs
 
     def update(self, rollouts: list[vf.RolloutOutput]):
         """Updates the buffer state with completed rollouts."""
@@ -256,6 +284,7 @@ class Buffer:
         self.num_examples_per_step = {env: zero_per_pool() for env in self.env_names}
         # num rollouts per env per step per pool (env_name -> (pool -> num_rollouts))
         self.num_rollouts_per_step = {env: zero_per_pool() for env in self.env_names}
+        self.num_sampled_examples_per_step = {env: 0 for env in self.env_names}
 
     def get_metrics(self) -> dict[str, float]:
         """Returns the buffer metrics for the current step."""
@@ -289,6 +318,12 @@ class Buffer:
         pool_ratios = mean_normalize(pool_counts)
         for pool, pool_ratio in zip(self.POOLS, pool_ratios):
             metrics[f"pool/{pool}"] = pool_ratio
+
+        sampled_total = sum(self.num_sampled_examples_per_step.values())
+        for env in self.env_names:
+            metrics[f"sampled_env_ratio/{env}"] = (
+                self.num_sampled_examples_per_step[env] / sampled_total if sampled_total > 0 else 0.0
+            )
 
         for env in self.env_names:
             env_num_examples_per_step_per_pool = self.num_examples_per_step[env]

@@ -10,6 +10,11 @@ import tomli_w
 from prime_rl.orchestrator.advantage import compute_advantages
 from prime_rl.orchestrator.eval_utils import compute_eval_ckpt_step, get_eval_sampling_args
 from prime_rl.orchestrator.event_loop_lag import EventLoopLagMonitor
+from prime_rl.orchestrator.metrics import (
+    compute_global_rollout_metrics,
+    get_prefixed_reward_stats,
+    get_scoped_rollout_stats,
+)
 from prime_rl.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
 from prime_rl.orchestrator.trajectories import (
     build_vlm_image_cache,
@@ -76,6 +81,21 @@ from prime_rl.utils.utils import (
     strip_env_version,
     to_col_format,
 )
+
+
+ROLLOUT_STATS_WITH_MIN = (
+    "seq_len",
+    "prefill_len",
+    "decode_len",
+    "samples_per_rollout",
+    "num_turns",
+    "generation_ms",
+    "scoring_ms",
+)
+
+ROLLOUT_STATS_WITHOUT_MIN = ("is_truncated",)
+
+PER_EXAMPLE_MEAN_COLUMNS = ROLLOUT_STATS_WITH_MIN + ROLLOUT_STATS_WITHOUT_MIN + ("reward",)
 
 
 @clean_exit
@@ -703,8 +723,58 @@ async def orchestrate(config: OrchestratorConfig):
             solve_all = (reward_per_problem == config.rollouts_per_example).mean()
             return solve_none, solve_all, 1 - solve_none - solve_all
 
-        # Group by example_id to average across rollouts within each problem
+        # Aggregate per-example means before reducing to a single scalar so repeated rollouts for
+        # the same example contribute equally in both the global and per-env views.
         by_example = results_df.groupby("example_id")
+        by_example_mean = by_example[list(PER_EXAMPLE_MEAN_COLUMNS)].mean()
+        metrics_by_example_mean = metrics_df.groupby(results_df.example_id).mean()
+
+        global_rollout_metrics = get_scoped_rollout_stats(
+            by_example_mean,
+            scope="all",
+            stats_with_min=ROLLOUT_STATS_WITH_MIN,
+            stats_without_min=ROLLOUT_STATS_WITHOUT_MIN,
+        )
+        global_reward_metrics = get_prefixed_reward_stats(by_example_mean.reward, prefix="reward/all")
+        # metrics/all/* is only meaningful when every sampled example emitted the metric.
+        # Shared metric names are assumed to have the same semantics across envs.
+        global_env_metrics = compute_global_rollout_metrics(metrics_by_example_mean)
+
+        per_env_metrics = {}
+        for env, env_df in results_df.groupby("task"):
+            env_by_example_mean = env_df.groupby("example_id")[list(PER_EXAMPLE_MEAN_COLUMNS)].mean()
+            env_metrics_by_example_mean = metrics_df.loc[env_df.index].groupby(env_df.example_id).mean()
+            solve_none, solve_all, effective_batch_size = compute_solve_rates(env_df)
+
+            per_env_metrics.update(
+                get_scoped_rollout_stats(
+                    env_by_example_mean,
+                    scope=env,
+                    stats_with_min=ROLLOUT_STATS_WITH_MIN,
+                    stats_without_min=ROLLOUT_STATS_WITHOUT_MIN,
+                )
+            )
+            per_env_metrics.update(get_prefixed_reward_stats(env_by_example_mean.reward, prefix=f"reward/{env}"))
+            per_env_metrics[f"solve_none/{env}"] = solve_none
+            per_env_metrics[f"solve_all/{env}"] = solve_all
+            per_env_metrics[f"effective_batch_size/{env}"] = effective_batch_size
+            per_env_metrics[f"stop_condition/{env}/generation_truncated"] = (
+                env_df.is_truncated & (env_df.stop_condition != "prompt_too_long")
+            ).mean()
+            for sc, rate in env_df.stop_condition.dropna().value_counts(normalize=True).items():
+                per_env_metrics[f"stop_condition/{env}/{sc}"] = rate
+            for metric in metrics_df.columns:
+                per_env_metrics[f"metrics/{env}/{metric}"] = env_metrics_by_example_mean[metric].mean()
+
+        val_reward_metrics = {}
+        if val_results_df is not None:
+            val_by_example_mean = val_results_df.groupby("example_id").reward.mean()
+            val_reward_metrics.update(get_prefixed_reward_stats(val_by_example_mean, prefix="val/reward/all"))
+            for env, env_df in val_results_df.groupby("task"):
+                env_val_by_example_mean = env_df.groupby("example_id").reward.mean()
+                val_reward_metrics.update(
+                    get_prefixed_reward_stats(env_val_by_example_mean, prefix=f"val/reward/{env}")
+                )
 
         solve_none, solve_all, effective_batch_size = compute_solve_rates(results_df)
         to_log = {
@@ -718,18 +788,6 @@ async def orchestrate(config: OrchestratorConfig):
             "progress/total_samples": progress.total_samples,
             "progress/total_problems": progress.total_problems,
             "progress/ckpt_step": ckpt_step,  # Shared W&B axis
-            # Sequence length metrics
-            "seq_len/all/mean": by_example.seq_len.mean().mean(),
-            "seq_len/all/max": by_example.seq_len.mean().max(),
-            "seq_len/all/min": by_example.seq_len.mean().min(),
-            "prefill_len/all/mean": by_example.prefill_len.mean().mean(),
-            "prefill_len/all/max": by_example.prefill_len.mean().max(),
-            "prefill_len/all/min": by_example.prefill_len.mean().min(),
-            "decode_len/all/mean": by_example.decode_len.mean().mean(),
-            "decode_len/all/max": by_example.decode_len.mean().max(),
-            "decode_len/all/min": by_example.decode_len.mean().min(),
-            "is_truncated/all/mean": by_example.is_truncated.mean().mean(),
-            "is_truncated/all/max": by_example.is_truncated.mean().max(),
             "stop_condition/all/generation_truncated": (
                 results_df.is_truncated & (results_df.stop_condition != "prompt_too_long")
             ).mean(),
@@ -737,22 +795,6 @@ async def orchestrate(config: OrchestratorConfig):
                 f"stop_condition/all/{sc}": rate
                 for sc, rate in results_df.stop_condition.dropna().value_counts(normalize=True).items()
             },
-            "samples_per_rollout/all/mean": by_example.samples_per_rollout.mean().mean(),
-            "samples_per_rollout/all/max": by_example.samples_per_rollout.mean().max(),
-            "samples_per_rollout/all/min": by_example.samples_per_rollout.mean().min(),
-            "num_turns/all/mean": by_example.num_turns.mean().mean(),
-            "num_turns/all/max": by_example.num_turns.mean().max(),
-            "num_turns/all/min": by_example.num_turns.mean().min(),
-            "generation_ms/all/mean": by_example.generation_ms.mean().mean(),
-            "generation_ms/all/max": by_example.generation_ms.mean().max(),
-            "generation_ms/all/min": by_example.generation_ms.mean().min(),
-            "scoring_ms/all/mean": by_example.scoring_ms.mean().mean(),
-            "scoring_ms/all/max": by_example.scoring_ms.mean().max(),
-            "scoring_ms/all/min": by_example.scoring_ms.mean().min(),
-            # Train reward
-            "reward/all/mean": by_example.reward.mean().mean(),
-            "reward/all/max": by_example.reward.mean().max(),
-            "reward/all/min": by_example.reward.mean().min(),
             "sampling/temperature": temperature,
             # Solve / batch metrics
             "solve_none/all": solve_none,
@@ -773,56 +815,17 @@ async def orchestrate(config: OrchestratorConfig):
             **event_loop_lag_monitor.get_metrics(),
             # Rollout filter metrics
             **filter_metrics,
+            # Global rollout metrics
+            **global_rollout_metrics,
+            **global_reward_metrics,
+            **global_env_metrics,
+            # Per-env rollout metrics
+            **per_env_metrics,
+            # Validation reward metrics
+            **val_reward_metrics,
             # W&B axis
             "step": progress.step,
         }
-
-        # Per-env metrics
-        per_env_columns = [
-            "seq_len",
-            "prefill_len",
-            "decode_len",
-            "is_truncated",
-            "samples_per_rollout",
-            "num_turns",
-            "generation_ms",
-            "scoring_ms",
-        ]
-
-        for env, env_df in results_df.groupby("task"):
-            env_by_example = env_df.groupby("example_id")
-            for col in per_env_columns:
-                to_log[f"{col}/{env}/mean"] = env_by_example[col].mean().mean()
-                to_log[f"{col}/{env}/max"] = env_by_example[col].mean().max()
-                if col != "is_truncated":
-                    to_log[f"{col}/{env}/min"] = env_by_example[col].mean().min()
-            to_log[f"reward/{env}/mean"] = env_by_example.reward.mean().mean()
-            to_log[f"reward/{env}/max"] = env_by_example.reward.mean().max()
-            to_log[f"reward/{env}/min"] = env_by_example.reward.mean().min()
-            solve_none, solve_all, effective_batch_size = compute_solve_rates(env_df)
-            to_log[f"solve_none/{env}"] = solve_none
-            to_log[f"solve_all/{env}"] = solve_all
-            to_log[f"effective_batch_size/{env}"] = effective_batch_size
-            to_log[f"stop_condition/{env}/generation_truncated"] = (
-                env_df.is_truncated & (env_df.stop_condition != "prompt_too_long")
-            ).mean()
-            for sc, rate in env_df.stop_condition.dropna().value_counts(normalize=True).items():
-                to_log[f"stop_condition/{env}/{sc}"] = rate
-            env_metrics_df = metrics_df.loc[env_df.index]
-            for metric in metrics_df.columns:
-                to_log[f"metrics/{env}/{metric}"] = env_metrics_df.groupby(env_df["example_id"])[metric].mean().mean()
-
-        # Optionally, add val metrics
-        if val_results_df is not None:
-            val_by_example = val_results_df.groupby("example_id")
-            to_log["val/reward/all/mean"] = val_by_example.reward.mean().mean()
-            to_log["val/reward/all/max"] = val_by_example.reward.mean().max()
-            to_log["val/reward/all/min"] = val_by_example.reward.mean().min()
-            for env, env_df in val_results_df.groupby("task"):
-                env_by_example = env_df.groupby("example_id")
-                to_log[f"val/reward/{env}/mean"] = env_by_example.reward.mean().mean()
-                to_log[f"val/reward/{env}/max"] = env_by_example.reward.mean().max()
-                to_log[f"val/reward/{env}/min"] = env_by_example.reward.mean().min()
 
         # Log metrics to monitor(s)
         monitor.log(to_log, step=progress.step)
